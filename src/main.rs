@@ -3,15 +3,22 @@
 // - Batch size greater than 1.
 // - More token filters (SuppressBlanks, ApplyTimestampRules).
 
+#[cfg(feature = "accelerate")]
+extern crate accelerate_src;
+
+#[cfg(feature = "mkl")]
+extern crate intel_mkl_src;
+
 use anyhow::{Error as E, Result};
 use candle_core::{Device, IndexOp, Tensor};
-use candle_nn::ops::softmax;
+use candle_nn::{ops::softmax, VarBuilder};
 use clap::{Parser, ValueEnum};
+use hf_hub::{api::sync::Api, Repo, RepoType};
 use rand::{distributions::Distribution, SeedableRng};
 use tokenizers::Tokenizer;
 
-pub mod multilingual;
-use candle_transformers::models::whisper::{self as m, Config};
+mod multilingual;
+use candle_transformers::models::whisper::{self as m, audio, Config};
 
 pub enum Model {
     Normal(m::model::Whisper),
@@ -56,7 +63,7 @@ impl Model {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct DecodingResult {
+struct DecodingResult {
     tokens: Vec<u32>,
     text: String,
     avg_logprob: f64,
@@ -67,25 +74,13 @@ pub struct DecodingResult {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct Segment {
+struct Segment {
     start: f64,
     duration: f64,
     dr: DecodingResult,
 }
 
-pub fn device(cpu: bool) -> Result<Device> {
-    if cpu {
-        Ok(Device::Cpu)
-    } else {
-        let device = Device::cuda_if_available(0)?;
-        if !device.is_cuda() {
-            println!("Running on CPU, to run on GPU, build this example with `--features cuda`");
-        }
-        Ok(device)
-    }
-}
-
-pub struct Decoder {
+struct Decoder {
     model: Model,
     rng: rand::rngs::StdRng,
     task: Option<Task>,
@@ -104,7 +99,7 @@ pub struct Decoder {
 
 impl Decoder {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    fn new(
         model: Model,
         tokenizer: Tokenizer,
         seed: u64,
@@ -133,7 +128,13 @@ impl Decoder {
         let transcribe_token = token_id(&tokenizer, m::TRANSCRIBE_TOKEN)?;
         let translate_token = token_id(&tokenizer, m::TRANSLATE_TOKEN)?;
         let eot_token = token_id(&tokenizer, m::EOT_TOKEN)?;
-        let no_speech_token = token_id(&tokenizer, m::NO_SPEECH_TOKEN)?;
+        let no_speech_token = m::NO_SPEECH_TOKENS
+            .iter()
+            .find_map(|token| token_id(&tokenizer, token).ok());
+        let no_speech_token = match no_speech_token {
+            None => anyhow::bail!("unable to find any non-speech token"),
+            Some(n) => n,
+        };
         Ok(Self {
             model,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
@@ -152,7 +153,7 @@ impl Decoder {
         })
     }
 
-    pub fn decode(&mut self, mel: &Tensor, t: f64) -> Result<DecodingResult> {
+    fn decode(&mut self, mel: &Tensor, t: f64) -> Result<DecodingResult> {
         let model = &mut self.model;
         let audio_features = model.encoder_forward(mel, true)?;
         if self.verbose {
@@ -238,7 +239,7 @@ impl Decoder {
         })
     }
 
-    pub fn decode_with_fallback(&mut self, segment: &Tensor) -> Result<DecodingResult> {
+    fn decode_with_fallback(&mut self, segment: &Tensor) -> Result<DecodingResult> {
         for (i, &t) in m::TEMPERATURES.iter().enumerate() {
             let dr: Result<DecodingResult> = self.decode(segment, t);
             if i == m::TEMPERATURES.len() - 1 {
@@ -261,7 +262,7 @@ impl Decoder {
         unreachable!()
     }
 
-    pub fn run(&mut self, mel: &Tensor) -> Result<Vec<Segment>> {
+    fn run(&mut self, mel: &Tensor) -> Result<Vec<Segment>> {
         let (_, _, content_frames) = mel.dims3()?;
         let mut seek = 0;
         let mut segments = vec![];
@@ -345,13 +346,13 @@ pub fn token_id(tokenizer: &Tokenizer, token: &str) -> candle_core::Result<u32> 
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum Task {
+enum Task {
     Transcribe,
     Translate,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum WhichModel {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum WhichModel {
     Tiny,
     #[value(name = "tiny.en")]
     TinyEn,
@@ -366,6 +367,7 @@ pub enum WhichModel {
     MediumEn,
     Large,
     LargeV2,
+    LargeV3,
     #[value(name = "distil-medium.en")]
     DistilMediumEn,
     #[value(name = "distil-large-v2")]
@@ -373,7 +375,7 @@ pub enum WhichModel {
 }
 
 impl WhichModel {
-    pub fn is_multilingual(&self) -> bool {
+    fn is_multilingual(&self) -> bool {
         match self {
             Self::Tiny
             | Self::Base
@@ -381,6 +383,7 @@ impl WhichModel {
             | Self::Medium
             | Self::Large
             | Self::LargeV2
+            | Self::LargeV3
             | Self::DistilLargeV2 => true,
             Self::TinyEn | Self::BaseEn | Self::SmallEn | Self::MediumEn | Self::DistilMediumEn => {
                 false
@@ -388,7 +391,7 @@ impl WhichModel {
         }
     }
 
-    pub fn model_and_revision(&self) -> (&'static str, &'static str) {
+    fn model_and_revision(&self) -> (&'static str, &'static str) {
         match self {
             Self::Tiny => ("openai/whisper-tiny", "main"),
             Self::TinyEn => ("openai/whisper-tiny.en", "refs/pr/15"),
@@ -400,6 +403,7 @@ impl WhichModel {
             Self::MediumEn => ("openai/whisper-medium.en", "main"),
             Self::Large => ("openai/whisper-large", "refs/pr/36"),
             Self::LargeV2 => ("openai/whisper-large-v2", "refs/pr/57"),
+            Self::LargeV3 => ("openai/whisper-large-v3", "main"),
             Self::DistilMediumEn => ("distil-whisper/distil-medium.en", "main"),
             Self::DistilLargeV2 => ("distil-whisper/distil-large-v2", "main"),
         }
@@ -408,54 +412,193 @@ impl WhichModel {
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
-pub struct Args {
+struct Args {
     /// Run on CPU rather than on GPU.
     #[arg(long)]
-    pub cpu: bool,
+    cpu: bool,
 
     #[arg(long)]
-    pub model_id: Option<String>,
+    model_id: Option<String>,
 
     /// The model to use, check out available models:
     /// https://huggingface.co/models?search=whisper
     #[arg(long)]
-    pub revision: Option<String>,
+    revision: Option<String>,
 
     /// The model to be used, can be tiny, small, medium.
-    #[arg(long, default_value = "distil-medium.en")]
-    pub model: WhichModel,
+    #[arg(long, default_value = "tiny.en")]
+    model: WhichModel,
 
     /// The input to be processed, in wav format, will default to `jfk.wav`. Alternatively
     /// this can be set to sample:jfk, sample:gb1, ... to fetch a sample from the following
     /// repo: https://huggingface.co/datasets/Narsil/candle_demo/
     #[arg(long)]
-    pub input: Option<String>,
+    input: Option<String>,
 
     /// The seed to use when generating random samples.
     #[arg(long, default_value_t = 299792458)]
-    pub seed: u64,
+    seed: u64,
 
     /// Enable tracing (generates a trace-timestamp.json file).
     #[arg(long)]
-    pub tracing: bool,
+    tracing: bool,
 
     #[arg(long)]
-    pub quantized: bool,
+    quantized: bool,
 
     /// Language.
     #[arg(long)]
-    pub language: Option<String>,
+    language: Option<String>,
 
     /// Task, when no task is specified, the input tokens contain only the sot token which can
     /// improve things when in no-timestamp mode.
     #[arg(long)]
-    pub task: Option<Task>,
+    task: Option<Task>,
 
     /// Timestamps mode, this is not fully implemented yet.
     #[arg(long)]
-    pub timestamps: bool,
+    timestamps: bool,
 
     /// Print the full DecodingResult structure rather than just the text.
     #[arg(long)]
-    pub verbose: bool,
+    verbose: bool,
+}
+
+pub fn device(cpu: bool) -> Result<Device> {
+    if cpu {
+        Ok(Device::Cpu)
+    } else {
+        let device = Device::cuda_if_available(0)?;
+        if !device.is_cuda() {
+            // println!("Running on CPU, to run on GPU, build this example with `--features cuda`");
+        }
+        Ok(device)
+    }
+}
+
+fn main() -> Result<()> {
+    use tracing_chrome::ChromeLayerBuilder;
+    use tracing_subscriber::prelude::*;
+
+    let args = Args::parse();
+    let _guard = if args.tracing {
+        let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
+        tracing_subscriber::registry().with(chrome_layer).init();
+        Some(guard)
+    } else {
+        None
+    };
+    let device = device(args.cpu)?;
+    let (default_model, default_revision) = if args.quantized {
+        ("lmz/candle-whisper", "main")
+    } else {
+        args.model.model_and_revision()
+    };
+    let default_model = default_model.to_string();
+    let default_revision = default_revision.to_string();
+    let (model_id, revision) = match (args.model_id, args.revision) {
+        (Some(model_id), Some(revision)) => (model_id, revision),
+        (Some(model_id), None) => (model_id, "main".to_string()),
+        (None, Some(revision)) => (default_model, revision),
+        (None, None) => (default_model, default_revision),
+    };
+
+    let (config_filename, tokenizer_filename, weights_filename, input) = {
+        let api = Api::new()?;
+        let dataset = api.dataset("Narsil/candle-examples".to_string());
+        let repo = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
+        let sample = if let Some(input) = args.input {
+            if let Some(sample) = input.strip_prefix("sample:") {
+                dataset.get(&format!("samples_{sample}.wav"))?
+            } else {
+                std::path::PathBuf::from(input)
+            }
+        } else {
+            // println!("No audio file submitted: Downloading https://huggingface.co/datasets/Narsil/candle_demo/blob/main/samples_jfk.wav");
+            dataset.get("samples_jfk.wav")?
+        };
+        let (config, tokenizer, model) = if args.quantized {
+            let ext = match args.model {
+                WhichModel::TinyEn => "tiny-en",
+                WhichModel::Tiny => "tiny",
+                _ => unimplemented!("no quantized support for {:?}", args.model),
+            };
+            (
+                repo.get(&format!("config-{ext}.json"))?,
+                repo.get(&format!("tokenizer-{ext}.json"))?,
+                repo.get(&format!("model-{ext}-q80.gguf"))?,
+            )
+        } else {
+            let config = repo.get("config.json")?;
+            let tokenizer = repo.get("tokenizer.json")?;
+            let model = repo.get("model.safetensors")?;
+            (config, tokenizer, model)
+        };
+        (config, tokenizer, model, sample)
+    };
+    let config: Config = serde_json::from_str(&std::fs::read_to_string(config_filename)?)?;
+    let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
+
+    let mel_bytes = match config.num_mel_bins {
+        80 => include_bytes!("melfilters.bytes").as_slice(),
+        128 => include_bytes!("melfilters128.bytes").as_slice(),
+        nmel => anyhow::bail!("unexpected num_mel_bins {nmel}"),
+    };
+    let mut mel_filters = vec![0f32; mel_bytes.len() / 4];
+    <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(mel_bytes, &mut mel_filters);
+
+    let mut input = std::fs::File::open(input)?;
+    let (header, data) = wav::read(&mut input)?;
+    // println!("loaded wav data: {header:?}");
+    if header.sampling_rate != m::SAMPLE_RATE as u32 {
+        anyhow::bail!("wav file must have a {} sampling rate", m::SAMPLE_RATE)
+    }
+    let data = data.as_sixteen().expect("expected 16 bit wav file");
+    let pcm_data: Vec<_> = data[..data.len() / header.channel_count as usize]
+        .iter()
+        .map(|v| *v as f32 / 32768.)
+        .collect();
+    // println!("pcm data loaded {}", pcm_data.len());
+    let mel = audio::pcm_to_mel(&config, &pcm_data, &mel_filters);
+    let mel_len = mel.len();
+    let mel = Tensor::from_vec(
+        mel,
+        (1, config.num_mel_bins, mel_len / config.num_mel_bins),
+        &device,
+    )?;
+    // println!("loaded mel: {:?}", mel.dims());
+
+    let mut model = if args.quantized {
+        let vb =
+            candle_transformers::quantized_var_builder::VarBuilder::from_gguf(&weights_filename)?;
+        Model::Quantized(m::quantized_model::Whisper::load(&vb, config)?)
+    } else {
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_filename], m::DTYPE, &device)? };
+        Model::Normal(m::model::Whisper::load(&vb, config)?)
+    };
+
+    let language_token = match (args.model.is_multilingual(), args.language) {
+        (true, None) => Some(multilingual::detect_language(&mut model, &tokenizer, &mel)?),
+        (false, None) => None,
+        (true, Some(language)) => match token_id(&tokenizer, &format!("<|{language}|>")) {
+            Ok(token_id) => Some(token_id),
+            Err(_) => anyhow::bail!("language {language} is not supported"),
+        },
+        (false, Some(_)) => {
+            anyhow::bail!("a language cannot be set for non-multilingual models")
+        }
+    };
+    let mut dc = Decoder::new(
+        model,
+        tokenizer,
+        args.seed,
+        &device,
+        language_token,
+        args.task,
+        args.timestamps,
+        args.verbose,
+    )?;
+    dc.run(&mel)?;
+    Ok(())
 }

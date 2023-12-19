@@ -1,7 +1,7 @@
 use candle_core::{IndexOp, Result, Tensor, D};
 use tokenizers::Tokenizer;
 
-pub const LANGUAGES: [(&str, &str); 99] = [
+const LANGUAGES: [(&str, &str); 99] = [
     ("en", "english"),
     ("zh", "chinese"),
     ("de", "german"),
