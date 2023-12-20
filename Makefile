@@ -6,12 +6,12 @@ VERSION := $(shell cat VERSION)
 
 # Tag the release
 tag_release:
-    git tag -a $(VERSION) -m "Release $(VERSION)"
-    git push origin $(VERSION)
+	@git tag -a $(VERSION) -m "Release $(VERSION)"
+	@git push origin $(VERSION)
 
 # Push the release to GitHub
 push_release:
-    git push origin --tags
+	@git push origin --tags
 
 # Full release process
 release: tag_release push_release
