@@ -16,10 +16,25 @@ jobs:
       with:
         profile: minimal
         toolchain: stable
+        target: x86_64-unknown-linux-musl
         override: true
+    - name: Install musl-tools
+      run: sudo apt-get update && sudo apt-get install musl-tools
 
-    - name: Build Release
-      run: cargo build --release
+    - name: Install OpenSSL
+      run: |
+        wget https://www.openssl.org/source/openssl-1.1.1k.tar.gz
+        tar -xzvf openssl-1.1.1k.tar.gz
+        cd openssl-1.1.1k
+        ./config no-shared --prefix=/usr/local/musl
+        make -j$(nproc) && sudo make install
+
+    - name: Build Release with musl and vendored OpenSSL
+      env:
+        OPENSSL_STATIC: 1
+        OPENSSL_DIR: /usr/local/musl
+        PKG_CONFIG_ALLOW_CROSS: 1
+      run: cargo build --release --target x86_64-unknown-linux-musl
 
     - name: Package Executable
       run: |
