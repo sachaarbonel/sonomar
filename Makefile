@@ -2,15 +2,14 @@
 
 # Project settings
 PROJECT_NAME := sonomar
-VERSION := $(shell cat VERSION)
 
-# Function to bump version numbers
-bump_version = $(shell echo $(1) | awk -F. -v OFS=. '{$(2)++; for (i=$(3); i<NF; i++) $i = 0; print}')
+# Function to read version from file
+get_version = $(shell cat VERSION)
 
 # Tag the release
 tag_release:
-	@git tag -a $(VERSION) -m "Release $(VERSION)"
-	@git push origin $(VERSION)
+	@git tag -a $(call get_version) -m "Release $(call get_version)"
+	@git push origin $(call get_version)
 
 # Push the release to GitHub
 push_release:
@@ -21,24 +20,21 @@ release: tag_release push_release
 
 # Major version bump
 major:
-	@$(eval NEW_VERSION := $(call bump_version,0.$(VERSION)))
-	@echo $(NEW_VERSION) > VERSION
-	@git commit -am "Bump version to $(NEW_VERSION)"
+	@./bump_major.sh
+	@git commit -am "Bump version to $(call get_version)"
 	@git push
-	@echo "Major version bumped to $(NEW_VERSION)"
+	@echo "Major version bumped to $(call get_version)"
 
 # Minor version bump
 minor:
-	@$(eval NEW_VERSION := $(call bump_version,1.$(VERSION)))
-	@echo $(NEW_VERSION) > VERSION
-	@git commit -am "Bump version to $(NEW_VERSION)"
+	@./bump_minor.sh
+	@git commit -am "Bump version to $(call get_version)"
 	@git push
-	@echo "Minor version bumped to $(NEW_VERSION)"
+	@echo "Minor version bumped to $(call get_version)"
 
 # Patch version bump
 patch:
-	@$(eval NEW_VERSION := $(call bump_version,2.$(VERSION)))
-	@echo $(NEW_VERSION) > VERSION
-	@git commit -am "Bump version to $(NEW_VERSION)"
+	@./bump_patch.sh
+	@git commit -am "Bump version to $(call get_version)"
 	@git push
-	@echo "Patch version bumped to $(NEW_VERSION)"
+	@echo "Patch version bumped to $(call get_version)"
