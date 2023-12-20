@@ -1,0 +1,37 @@
+name: Release Workflow
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+
+    - name: Build Release
+      run: cargo build --release
+
+    - name: Package Executable
+      run: |
+        cp target/release/sonomar ./sonomar
+        tar czvf sonomar.tar.gz ./sonomar
+
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ./sonomar.tar.gz
+        asset_name: sonomar.tar.gz
+        asset_content_type: application/gzip
